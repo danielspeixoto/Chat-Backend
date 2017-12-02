@@ -1,6 +1,8 @@
 
 
 import io.ktor.application.Application
+import io.ktor.application.ApplicationCallPipeline
+import io.ktor.application.call
 import io.ktor.application.install
 import io.ktor.content.defaultResource
 import io.ktor.content.resources
@@ -8,12 +10,14 @@ import io.ktor.content.static
 import io.ktor.features.CallLogging
 import io.ktor.features.DefaultHeaders
 import io.ktor.routing.Routing
+import io.ktor.sessions.*
 import io.ktor.websocket.*
-import io.netty.util.internal.ConcurrentSet
 import kotlinx.coroutines.experimental.channels.consumeEach
 import java.time.Duration
+import java.util.concurrent.ConcurrentHashMap
 
-var arr = ConcurrentSet<WebSocketSession>()
+var arr = ConcurrentHashMap<Int, WebSocketSession>()
+var idCounter : Int = 1
 
 fun Application.main() {
     install(DefaultHeaders)
@@ -21,19 +25,38 @@ fun Application.main() {
     install(WebSockets) {
         pingPeriod = Duration.ofMinutes(1)
     }
+    install(Sessions) {
+        cookie<ChatId>("chatId")
+    }
+
+    intercept(ApplicationCallPipeline.Infrastructure) {
+        if (call.sessions.get<ChatId>() == null) {
+            call.sessions.set(ChatId(idCounter++.toString()))
+        }
+    }
+
     install(Routing) {
-        webSocket("/ws{name}") {
-            add(this)
-            broadcast("Hi")
+        webSocket("/ws") {
+            val chatId = call.sessions.get<ChatId>()
+
+            if (chatId == null) {
+                close(CloseReason(CloseReason.Codes.VIOLATED_POLICY, "No Id"))
+                return@webSocket
+            }
+
+            val id = chatId.id.toInt()
+
+            add(this, id)
+            broadcast("$id: Hi")
             try {
                 incoming.consumeEach { frame ->
                     if (frame is Frame.Text) {
-                        broadcast(frame.readText())
+                        broadcast("$id: ${frame.readText()}")
                     }
                 }
             } finally {
-                remove(this)
-                broadcast("left")
+                remove(id)
+                broadcast("$id: left")
             }
         }
         static {
@@ -43,16 +66,18 @@ fun Application.main() {
     }
 }
 
-suspend fun add(socket : WebSocketSession) {
-    arr.add(socket)
+suspend fun add(socket : WebSocketSession, id : Int) {
+    arr.put(id, socket)
 }
 
 suspend fun broadcast(msg : String) {
-    arr.forEach {
-        it.send(Frame.Text(msg))
+    for((_, value) in arr) {
+        value.send(Frame.Text(msg))
     }
 }
 
-suspend fun remove(socket : WebSocketSession) {
-    arr.remove(socket)
+suspend fun remove(id : Int) {
+    arr.remove(id)
 }
+
+data class ChatId(val id : String)
